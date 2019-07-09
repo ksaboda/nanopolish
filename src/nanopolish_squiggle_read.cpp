@@ -13,6 +13,7 @@
 #include "nanopolish_methyltrain.h"
 #include "nanopolish_extract.h"
 #include "nanopolish_raw_loader.h"
+#include "nanopolish_fast5_io.h"
 
 extern "C" {
 #include "event_detection.h"
@@ -31,6 +32,7 @@ int g_unparseable_reads = 0;
 int g_qc_fail_reads = 0;
 int g_failed_calibration_reads = 0;
 int g_failed_alignment_reads = 0;
+int g_bad_fast5_file = 0;
 
 const double MIN_CALIBRATION_VAR = 2.5;
 
@@ -70,35 +72,57 @@ SquiggleRead::SquiggleRead(const std::string& name, const ReadDB& read_db, const
     pore_type(PT_UNKNOWN),
     f_p(nullptr)
 {
+
     this->events_per_base[0] = events_per_base[1] = 0.0f;
     this->base_model[0] = this->base_model[1] = NULL;
     this->fast5_path = read_db.get_signal_path(this->read_name);
+    g_total_reads += 1;
+    if(this->fast5_path == "") {
+        g_bad_fast5_file += 1;
+        return;
+    }
 
-    #pragma omp critical(sr_load_fast5)
-    {
-        this->f_p = new fast5::File(fast5_path);
-        assert(this->f_p->is_open());
+    // Get the read type from the fast5 file
+    fast5_file f5_file = fast5_open(fast5_path);
+    if(fast5_is_open(f5_file)) {
+
+        std::string sequencing_kit = fast5_get_sequencing_kit(f5_file, this->read_name);
+        std::string experiment_type = fast5_get_experiment_type(f5_file, this->read_name);
 
         // Try to detect whether this read is DNA or RNA
-        this->nucleotide_type = SRNT_DNA;
-        if(this->f_p->have_context_tags_params()) {
-            fast5::Context_Tags_Params context_tags = this->f_p->get_context_tags_params();
-            std::string experiment_type = context_tags["experiment_type"];
-            if(experiment_type == "rna") {
-                this->nucleotide_type = SRNT_RNA;
-            }
-        }
+        // Fix issue 531: experiment_type in fast5 is "rna" for cDNA kit dcs108
+        bool rna_experiment = experiment_type == "rna" || experiment_type == "internal_rna";
+        this->nucleotide_type = rna_experiment && sequencing_kit != "sqk-dcs108" ? SRNT_RNA : SRNT_DNA;
 
+        // Did this read come from nanopolish extract?
         bool is_event_read = is_extract_read_name(this->read_name);
+
+        // Use the legacy loader for DNA reads from extract, otherwise use the new loader
         if(this->nucleotide_type == SRNT_DNA && is_event_read) {
-            load_from_events(flags);
+            try {
+                #pragma omp critical(sr_load_fast5)
+                {
+                    this->f_p = new fast5::File(fast5_path);
+                    assert(this->f_p->is_open());
+                    load_from_events(flags);
+                }
+            } catch(hdf5_tools::Exception e) {
+                fprintf(stderr, "[warning] fast5 file is unreadable and will be skipped: %s\n", fast5_path.c_str());
+                g_bad_fast5_file += 1;
+            }
+
+            delete this->f_p;
+            this->f_p = nullptr;
         } else {
             this->read_sequence = read_db.get_read_sequence(read_name);
-            load_from_raw(flags);
+            load_from_raw(f5_file, flags);
         }
 
-        delete this->f_p;
-        this->f_p = nullptr;
+        fast5_close(f5_file);
+
+    } else {
+        fprintf(stderr, "[warning] fast5 file is unreadable and will be skipped: %s\n", fast5_path.c_str());
+        g_bad_fast5_file += 1;
     }
 
     if(!this->events[0].empty()) {
@@ -247,7 +271,7 @@ void SquiggleRead::load_from_events(const uint32_t flags)
 }
 
 //
-void SquiggleRead::load_from_raw(const uint32_t flags)
+void SquiggleRead::load_from_raw(fast5_file& f5_file, const uint32_t flags)
 {
     // File not in db, can't load
     if(this->fast5_path == "" || this->read_sequence == "") {
@@ -279,33 +303,12 @@ void SquiggleRead::load_from_raw(const uint32_t flags)
     this->base_model[strand_idx] = PoreModelSet::get_model(kit, alphabet, strand_str, k);
     assert(this->base_model[strand_idx] != NULL);
 
-    // Ensure signal file is available for read
-    assert(f_p->is_open());
-
     // Read the sample rate
-    auto channel_params = f_p->get_channel_id_params();
-    this->sample_rate = channel_params.sampling_rate;
+    auto channel_params = fast5_get_channel_params(f5_file, this->read_name);
+    this->sample_rate = channel_params.sample_rate;
 
     // Read the actual samples
-    auto& sample_read_names = f_p->get_raw_samples_read_name_list();
-    if(sample_read_names.empty()) {
-        fprintf(stderr, "Error, no raw samples found\n");
-        exit(EXIT_FAILURE);
-    }
-
-    // we assume the first raw sample read is the one we're after
-    std::string sample_read_name = sample_read_names.front();
-    std::vector<float> samples = f_p->get_raw_samples(sample_read_name);
-
-    // convert samples to scrappie's format (for event detection)
-    raw_table rt;
-    rt.n = samples.size();
-    rt.start = 0;
-    rt.end = samples.size() - 1;
-    rt.raw = (float*)malloc(sizeof(float) * samples.size());
-    for(size_t i = 0; i < samples.size(); ++i) {
-        rt.raw[i] = samples[i];
-    }
+    raw_table rt = fast5_get_raw_samples(f5_file, this->read_name, channel_params);
 
     // trim using scrappie's internal method
     // parameters taken directly from scrappie defaults
@@ -318,7 +321,7 @@ void SquiggleRead::load_from_raw(const uint32_t flags)
     assert(rt.n > 0);
     assert(et.n > 0);
 
-    // 
+    //
     this->scalings[strand_idx] = estimate_scalings_using_mom(this->read_sequence,
                                                              *this->base_model[strand_idx],
                                                              et);
@@ -332,7 +335,16 @@ void SquiggleRead::load_from_raw(const uint32_t flags)
         start_time += length_in_seconds;
     }
 
-    // If sequencing RNA, reverse the events to be 3'->5'
+    if(flags & SRF_LOAD_RAW_SAMPLES) {
+        this->sample_start_time = 0;
+        this->samples.resize(rt.n);
+        for(size_t i = 0; i < this->samples.size(); ++i) {
+            assert(rt.start + i < rt.n);
+            this->samples[i] = rt.raw[rt.start + i];
+        }
+    }
+
+    // If sequencing RNA, reverse the events to be 5'->3'
     if(this->nucleotide_type == SRNT_RNA) {
         std::reverse(this->events[strand_idx].begin(), this->events[strand_idx].end());
     }
@@ -404,7 +416,6 @@ void SquiggleRead::load_from_raw(const uint32_t flags)
         this->events_per_base[strand_idx] = 0.0f;
         g_failed_alignment_reads += 1;
     }
-    g_total_reads += 1;
 
     // Filter poor quality reads that have too many "stays"
     if(!this->events[strand_idx].empty() && this->events_per_base[strand_idx] > 5.0) {
@@ -838,7 +849,6 @@ std::vector<EventRangeForBase> SquiggleRead::read_reconstruction(const std::stri
     std::string classification = !out_event_map.empty() ? "goodread" : "badread";
     fprintf(stderr, "[final] %s %zu out of %zu kmers mismatch (%.2lf) classification: %s\n", this->fast5_path.c_str(), distinct_mismatches, n_read_kmers, mismatch_rate, classification.c_str());
 #endif
-    g_total_reads += 1;
     return out_event_map;
 }
 
@@ -1076,20 +1086,16 @@ std::vector<EventAlignment> SquiggleRead::get_eventalignment_for_1d_basecalls(co
 
 size_t SquiggleRead::get_sample_index_at_time(size_t sample_time) const
 {
-    return sample_time - sample_start_time;
+    return sample_time - this->sample_start_time;
 }
 
 //
 std::vector<float> SquiggleRead::get_scaled_samples_for_event(size_t strand_idx, size_t event_idx) const
 {
-    double event_start_time = this->events[strand_idx][event_idx].start_time;
-    double event_duration = this->events[strand_idx][event_idx].duration;
-
-    size_t start_idx = this->get_sample_index_at_time(event_start_time * this->sample_rate);
-    size_t end_idx = this->get_sample_index_at_time((event_start_time + event_duration) * this->sample_rate);
+    std::pair<size_t, size_t> sample_range = get_event_sample_idx(strand_idx, event_idx);
 
     std::vector<float> out;
-    for(size_t i = start_idx; i < end_idx; ++i) {
+    for(size_t i = sample_range.first; i < sample_range.second; ++i) {
         double curr_sample_time = (this->sample_start_time + i) / this->sample_rate;
         //fprintf(stderr, "event_start: %.5lf sample start: %.5lf curr: %.5lf rate: %.2lf\n", event_start_time, this->sample_start_time / this->sample_rate, curr_sample_time, this->sample_rate);
         double s = this->samples[i];
@@ -1101,6 +1107,18 @@ std::vector<float> SquiggleRead::get_scaled_samples_for_event(size_t strand_idx,
         out.push_back(scaled_s);
     }
     return out;
+}
+
+// return a pair of value corresponding to the start and end index of a given index on the signal
+std::pair<size_t, size_t> SquiggleRead::get_event_sample_idx(size_t strand_idx, size_t event_idx) const
+{
+    double event_start_time = this->events[strand_idx][event_idx].start_time;
+    double event_duration = this->events[strand_idx][event_idx].duration;
+
+    size_t start_idx = this->get_sample_index_at_time(event_start_time * this->sample_rate);
+    size_t end_idx = this->get_sample_index_at_time((event_start_time + event_duration) * this->sample_rate);
+
+    return std::make_pair(start_idx, end_idx);
 }
 
 void SquiggleRead::detect_pore_type()

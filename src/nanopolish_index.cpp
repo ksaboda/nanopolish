@@ -14,6 +14,7 @@
 #define SUBPROGRAM "index"
 
 #include <iostream>
+#include <fstream>
 #include <sstream>
 #include <getopt.h>
 
@@ -24,6 +25,7 @@
 #include "fs_support.hpp"
 #include "logger.hpp"
 #include "profiler.h"
+#include "nanopolish_fast5_io.h"
 
 static const char *INDEX_VERSION_MESSAGE =
 SUBPROGRAM " Version " PACKAGE_VERSION "\n"
@@ -39,33 +41,70 @@ static const char *INDEX_USAGE_MESSAGE =
 "      --version                        display version\n"
 "  -v, --verbose                        display verbose output\n"
 "  -d, --directory                      path to the directory containing the raw ONT signal files. This option can be given multiple times.\n"
-"  -f, --fast5-fofn                     file containing the paths to each fast5 file for the run\n"
+"  -s, --sequencing-summary             the sequencing summary file from albacore, providing this option will make indexing much faster\n"
+"  -f, --summary-fofn                   file containing the paths to the sequencing summary files (one per line)\n"
 "\nReport bugs to " PACKAGE_BUGREPORT "\n\n";
 
 namespace opt
 {
     static unsigned int verbose = 0;
     static std::vector<std::string> raw_file_directories;
-    static std::string fast5_fofn;
     static std::string reads_file;
+    static std::vector<std::string> sequencing_summary_files;
+    static std::string sequencing_summary_fofn;
 }
 static std::ostream* os_p;
 
-void index_file(ReadDB& read_db, const std::string& fn)
+//
+void index_file_from_map(ReadDB& read_db, const std::string& fn, const std::multimap<std::string, std::string>& fast5_to_read_name_map)
 {
-    PROFILE_FUNC("index_file")
-    fast5::File* fp = new fast5::File(fn);
-    if(fp->is_open()) {
-        fast5::Raw_Samples_Params params = fp->get_raw_samples_params();
-        std::string read_id = params.read_id;
-        read_db.add_signal_path(read_id, fn);
-    }
-    delete fp;
-} // process_file
+    PROFILE_FUNC("index_file_from_map")
 
-void index_path(ReadDB& read_db, const std::string& path)
+    // Check if this fast5 file is in the map
+    size_t last_dir_pos = fn.find_last_of("/");
+    std::string fast5_basename = last_dir_pos == std::string::npos ? fn : fn.substr(last_dir_pos + 1);
+
+    auto range = fast5_to_read_name_map.equal_range(fast5_basename);
+    for(auto iter = range.first; iter != range.second; ++iter) {
+        if(read_db.has_read(iter->second)) {
+            read_db.add_signal_path(iter->second.c_str(), fn);
+        }
+    }
+}
+
+//
+void index_file_from_fast5(ReadDB& read_db, const std::string& fn)
 {
-    fprintf(stderr, "Indexing %s\n", path.c_str());
+    PROFILE_FUNC("index_file_from_fast5")
+
+    fast5_file f5_file = fast5_open(fn);
+    if(!fast5_is_open(f5_file)) {
+        fprintf(stderr, "could not open fast5 file: %s\n", fn.c_str());
+    }
+
+    if(f5_file.is_multi_fast5) {
+        std::vector<std::string> read_groups = fast5_get_multi_read_groups(f5_file);
+        std::string prefix = "read_";
+        for(size_t group_idx = 0; group_idx < read_groups.size(); ++group_idx) {
+            std::string group_name = read_groups[group_idx];
+            if(group_name.find(prefix) == 0) {
+                std::string read_id = group_name.substr(prefix.size());
+                read_db.add_signal_path(read_id, fn);
+            }
+        }
+    } else {
+        std::string read_id = fast5_get_read_id_single_fast5(f5_file);
+        if(read_id != "") {
+            read_db.add_signal_path(read_id, fn);
+        }
+    }
+    fast5_close(f5_file);
+}
+
+//
+void index_path(ReadDB& read_db, const std::string& path, const std::multimap<std::string, std::string>& fast5_to_read_name_map)
+{
+    fprintf(stderr, "[readdb] indexing %s\n", path.c_str());
     if (is_directory(path)) {
         auto dir_list = list_directory(path);
         for (const auto& fn : dir_list) {
@@ -74,38 +113,102 @@ void index_path(ReadDB& read_db, const std::string& path)
             }
 
             std::string full_fn = path + "/" + fn;
-            if(is_directory(full_fn)) {
+            bool is_fast5 = full_fn.find(".fast5") != -1;
+            bool in_map = fast5_to_read_name_map.find(fn) != fast5_to_read_name_map.end();
+
+            // JTS 04/19: is_directory is painfully slow so we first check if the file is in the name map
+            // if it is, it is definitely not a directory so we can skip the system call
+            if(!in_map && is_directory(full_fn)) {
                 // recurse
-                index_path(read_db, full_fn);
-                read_db.print_stats();
-            } else if (full_fn.find(".fast5") != -1 && fast5::File::is_valid_file(full_fn)) {
-                index_file(read_db, full_fn);
+                index_path(read_db, full_fn, fast5_to_read_name_map);
+            } else if (is_fast5) {
+                if(!fast5_to_read_name_map.empty()) {
+                    index_file_from_map(read_db, full_fn, fast5_to_read_name_map);
+                } else {
+                    index_file_from_fast5(read_db, full_fn);
+                }
             }
         }
     }
-} // process_path
+}
 
-void process_fast5_fofn(ReadDB& read_db, const std::string& fast5_fofn)
+// read sequencing summary files from the fofn and add them to the list
+void process_summary_fofn()
 {
-    //
-    std::ifstream in_file(fast5_fofn.c_str());
+    if(opt::sequencing_summary_fofn.empty()) {
+        return;
+    }
+
+    // open
+    std::ifstream in_file(opt::sequencing_summary_fofn.c_str());
     if(in_file.bad()) {
-        fprintf(stderr, "error: could not file %s\n", fast5_fofn.c_str());
+        fprintf(stderr, "error: could not file %s\n", opt::sequencing_summary_fofn.c_str());
         exit(EXIT_FAILURE);
     }
 
     // read
-    size_t count = 0;
     std::string filename;
     while(getline(in_file, filename)) {
-        if(count++ % 1000 == 0) {
-            fprintf(stderr, "Loaded %zu from fofn\n", count);
-        }
-        index_file(read_db, filename);
+        opt::sequencing_summary_files.push_back(filename);
     }
 }
 
-static const char* shortopts = "vd:f:";
+//
+void exit_bad_header(const std::string& str, const std::string& filename)
+{
+    fprintf(stderr, "Could not find %s column in the header of %s\n", str.c_str(), filename.c_str());
+    exit(EXIT_FAILURE);
+}
+
+//
+void parse_sequencing_summary(const std::string& filename, std::multimap<std::string, std::string>& out_map)
+{
+    // open
+    std::ifstream in_file(filename.c_str());
+    if(!in_file.good()) {
+        fprintf(stderr, "error: could not read file %s\n", filename.c_str());
+        exit(EXIT_FAILURE);
+    }
+
+    // read header to get the column index of the read and file name
+    std::string header;
+    getline(in_file, header);
+    std::vector<std::string> fields = split(header, '\t');
+
+    const std::string READ_NAME_STR = "read_id";
+    const std::string FILENAME_STR = "filename";
+    size_t filename_idx = -1;
+    size_t read_name_idx = -1;
+
+    for(size_t i = 0; i < fields.size(); ++i) {
+        if(fields[i] == READ_NAME_STR) {
+            read_name_idx = i;
+        }
+
+        if(fields[i] == FILENAME_STR) {
+            filename_idx = i;
+        }
+    }
+
+    if(filename_idx == -1) {
+        exit_bad_header(FILENAME_STR, filename);
+    }
+
+    if(read_name_idx == -1) {
+        exit_bad_header(READ_NAME_STR, filename);
+    }
+
+    // read records and add to map
+    std::string line;
+    while(getline(in_file, line)) {
+        fields = split(line, '\t');
+        std::string fast5_filename = fields[filename_idx];
+        std::string read_name = fields[read_name_idx];
+        out_map.insert(std::make_pair(fast5_filename, read_name));
+    }
+}
+
+static const char* shortopts = "vd:f:s:";
 
 enum {
     OPT_HELP = 1,
@@ -114,12 +217,13 @@ enum {
 };
 
 static const struct option longopts[] = {
-    { "help",               no_argument,       NULL, OPT_HELP },
-    { "version",            no_argument,       NULL, OPT_VERSION },
-    { "log-level",          required_argument, NULL, OPT_LOG_LEVEL },
-    { "verbose",            no_argument,       NULL, 'v' },
-    { "directory",          required_argument, NULL, 'd' },
-    { "fast5-fofn",         required_argument, NULL, 'f' },
+    { "help",                      no_argument,       NULL, OPT_HELP },
+    { "version",                   no_argument,       NULL, OPT_VERSION },
+    { "log-level",                 required_argument, NULL, OPT_LOG_LEVEL },
+    { "verbose",                   no_argument,       NULL, 'v' },
+    { "directory",                 required_argument, NULL, 'd' },
+    { "sequencing-summary-file",   required_argument, NULL, 's' },
+    { "summary-fofn",              required_argument, NULL, 'f' },
     { NULL, 0, NULL, 0 }
 };
 
@@ -140,8 +244,9 @@ void parse_index_options(int argc, char** argv)
                 log_level.push_back(arg.str());
                 break;
             case 'v': opt::verbose++; break;
+            case 's': opt::sequencing_summary_files.push_back(arg.str()); break;
             case 'd': opt::raw_file_directories.push_back(arg.str()); break;
-            case 'f': arg >> opt::fast5_fofn; break;
+            case 'f': arg >> opt::sequencing_summary_fofn; break;
         }
     }
 
@@ -159,8 +264,8 @@ void parse_index_options(int argc, char** argv)
         std::cerr << SUBPROGRAM ": too many arguments\n";
         die = true;
     }
-    
-    if (die) 
+
+    if (die)
     {
         std::cout << "\n" << INDEX_USAGE_MESSAGE;
         exit(EXIT_FAILURE);
@@ -172,11 +277,20 @@ void parse_index_options(int argc, char** argv)
 int index_main(int argc, char** argv)
 {
     parse_index_options(argc, argv);
-    
+
+    // Read a map from fast5 files to read name from the sequencing summary files (if any)
+    process_summary_fofn();
+    std::multimap<std::string, std::string> fast5_to_read_name_map;
+    for(const auto& ss_filename : opt::sequencing_summary_files) {
+        if(opt::verbose > 2) {
+            fprintf(stderr, "summary: %s\n", ss_filename.c_str());
+        }
+        parse_sequencing_summary(ss_filename, fast5_to_read_name_map);
+    }
+
     // import read names, and possibly fast5 paths, from the fasta/fastq file
     ReadDB read_db;
     read_db.build(opt::reads_file);
-
     bool all_reads_have_paths = read_db.check_signal_paths();
 
     // if the input fastq did not contain a complete set of paths
@@ -184,15 +298,17 @@ int index_main(int argc, char** argv)
     if(!all_reads_have_paths) {
 
         for(const auto& dir_name : opt::raw_file_directories) {
-            index_path(read_db, dir_name);
-        }
-
-        if(!opt::fast5_fofn.empty()) {
-            process_fast5_fofn(read_db, opt::fast5_fofn);
+            index_path(read_db, dir_name, fast5_to_read_name_map);
         }
     }
 
-    read_db.print_stats();
-    read_db.save();
+    size_t num_with_path = read_db.get_num_reads_with_path();
+    if(num_with_path == 0) {
+        fprintf(stderr, "Error: no fast5 files found\n");
+        exit(EXIT_FAILURE);
+    } else {
+        read_db.print_stats();
+        read_db.save();
+    }
     return 0;
 }

@@ -18,6 +18,13 @@
 
 //#define DEBUG_HAPLOTYPE_SELECTION 1
 
+std::string Variant::make_vcf_header_key_value(const std::string& key, const std::string& value)
+{
+    std::stringstream ss;
+    ss << "##" << key << "=" << value;
+    return ss.str();
+}
+
 std::string Variant::make_vcf_tag_string(const std::string& tag,
                                          const std::string& id,
                                          int count,
@@ -31,11 +38,11 @@ std::string Variant::make_vcf_tag_string(const std::string& tag,
 }
 
 void Variant::write_vcf_header(FILE* fp,
-                               const std::vector<std::string>& tag_lines)
+                               const std::vector<std::string>& header_lines)
 {
 
     fprintf(fp, "##fileformat=VCFv4.2\n");
-    for(const std::string& line : tag_lines) {
+    for(const std::string& line : header_lines) {
         fprintf(fp, "%s\n", line.c_str());
     }
     fprintf(fp, "#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	sample\n");
@@ -384,7 +391,13 @@ std::vector<Variant> simple_call(VariantGroup& variant_group,
         v.add_info("TotalReads", group_reads.size());
         v.add_info("AlleleCount", var_count);
         v.add_info("SupportFraction", read_variant_support[vi] / group_reads.size());
-        v.genotype = make_genotype(var_count, ploidy);
+
+        if(group_reads.size() > 0) {
+            v.genotype = make_genotype(var_count, ploidy);
+        } else {
+            v.genotype = ".";
+        }
+
         output_variants.push_back(v);
     }
 

@@ -112,11 +112,22 @@ void ReadDB::import_reads(const std::string& input_filename, const std::string& 
 
     // Open writers
     FILE* write_fp = fopen(out_fasta_filename.c_str(), "w");
+    if(write_fp == NULL) {
+        fprintf(stderr, "error: could not open %s for write\n", out_fasta_filename.c_str());
+        exit(EXIT_FAILURE);
+    }
+
     BGZF* bgzf_write_fp = bgzf_dopen(fileno(write_fp), "w");
+    if(bgzf_write_fp == NULL) {
+        fprintf(stderr, "error: could not open %s for bgzipped write\n", out_fasta_filename.c_str());
+        exit(EXIT_FAILURE);
+    }
 
     // read input sequences, add to DB and convert to fasta
+    int ret = 0;
     kseq_t* seq = kseq_init(gz_read_fp);
-    while(kseq_read(seq) >= 0) {
+    while((ret = kseq_read(seq)) >= 0) {
+
         // Check for a path to the fast5 file in the comment of the read
         std::string path = "";
         if(seq->comment.l > 0) {
@@ -128,16 +139,18 @@ void ReadDB::import_reads(const std::string& input_filename, const std::string& 
             path = fields.back();
 
             // as a sanity check we require the path name to end in ".fast5"
-            if(path.substr(path.length() - 6) != ".fast5") {
+            if(path.length() < 6 || path.substr(path.length() - 6) != ".fast5") {
                 path = "";
             }
         }
         
         // sanity check that the read does not exist in the database
+        // JTS 04/2019: changed error to warning to account for duplicate reads coming out of
+        // some versions of guppy.
         auto iter = m_data.find(seq->name.s);
         if(iter != m_data.end()) {
-            fprintf(stderr, "Error: duplicate read name %s found in fasta file\n", seq->name.s);
-            exit(EXIT_FAILURE);
+            fprintf(stderr, "Warning: duplicate read name %s found in fasta file\n", seq->name.s);
+            continue;
         }
         
         // add path
@@ -157,6 +170,12 @@ void ReadDB::import_reads(const std::string& input_filename, const std::string& 
         }
     }
 
+    // check for abnormal exit conditions
+    if(ret <= -2) {
+        fprintf(stderr, "kseq_read returned %d indicating an error with the input file %s\n", ret, input_filename.c_str());
+        exit(EXIT_FAILURE);
+    }
+
     // cleanup
     kseq_destroy(seq);
     
@@ -171,6 +190,12 @@ void ReadDB::import_reads(const std::string& input_filename, const std::string& 
 void ReadDB::add_signal_path(const std::string& read_id, const std::string& path)
 {
     m_data[read_id].signal_data_path = path;
+}
+
+bool ReadDB::has_read(const std::string& read_id) const
+{
+    const auto& iter = m_data.find(read_id);
+    return iter != m_data.end();
 }
 
 //
@@ -221,14 +246,21 @@ void ReadDB::save() const
 
 
 //
-bool ReadDB::check_signal_paths() const
+size_t ReadDB::get_num_reads_with_path() const
 {
+    size_t num_reads_with_path = 0;
     for(const auto& iter : m_data) {
-        if(iter.second.signal_data_path == "") {
-            return false;
+        if(iter.second.signal_data_path != "") {
+            num_reads_with_path += 1;
         }
     }
-    return true;
+    return num_reads_with_path;
+}
+
+bool ReadDB::check_signal_paths() const
+{
+    size_t num_reads_with_path = get_num_reads_with_path();
+    return num_reads_with_path == m_data.size();
 }
 
 //
@@ -238,5 +270,5 @@ void ReadDB::print_stats() const
     for(const auto& iter : m_data) {
         num_reads_with_path += iter.second.signal_data_path != "";
     }
-    fprintf(stderr, "[readdb] num reads: %zu, num reads with path: %zu\n", m_data.size(), num_reads_with_path);
+    fprintf(stderr, "[readdb] num reads: %zu, num reads with path to fast5: %zu\n", m_data.size(), num_reads_with_path);
 }

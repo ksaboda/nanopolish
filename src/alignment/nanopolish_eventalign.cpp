@@ -31,9 +31,13 @@
 #include "nanopolish_read_db.h"
 #include "nanopolish_hmm_input_sequence.h"
 #include "nanopolish_pore_model_set.h"
+#include "nanopolish_bam_processor.h"
 #include "H5pubconf.h"
 #include "profiler.h"
 #include "progress.h"
+
+//
+using namespace std::placeholders;
 
 //
 // Getopt
@@ -59,11 +63,13 @@ static const char *EVENTALIGN_USAGE_MESSAGE =
 "  -b, --bam=FILE                       the reads aligned to the genome assembly are in bam FILE\n"
 "  -g, --genome=FILE                    the genome we are computing a consensus for is in FILE\n"
 "  -t, --threads=NUM                    use NUM threads (default: 1)\n"
+"  -q, --min-mapping-quality=NUM        only use reads with mapping quality at least NUM (default: 0)\n"
 "      --scale-events                   scale events to the model, rather than vice-versa\n"
 "      --progress                       print out a progress message\n"
 "  -n, --print-read-names               print read names instead of indexes\n"
 "      --summary=FILE                   summarize the alignment of each read/strand in FILE\n"
 "      --samples                        write the raw samples for the event to the tsv output\n"
+"      --signal-index                   write the raw signal start and end index values for the event to the tsv output\n"
 "      --models-fofn=FILE               read alternative k-mer models from FILE\n"
 "\nReport bugs to " PACKAGE_BUGREPORT "\n\n";
 
@@ -80,32 +86,36 @@ namespace opt
     static int progress = 0;
     static int num_threads = 1;
     static int scale_events = 0;
-    static int batch_size = 128;
+    static int batch_size = 512;
+    static int min_mapping_quality = 0;
     static bool print_read_names;
     static bool full_output;
     static bool write_samples = false;
+    static bool write_signal_index = false;
 }
 
-static const char* shortopts = "r:b:g:t:w:vn";
+static const char* shortopts = "r:b:g:t:w:q:vn";
 
-enum { OPT_HELP = 1, OPT_VERSION, OPT_PROGRESS, OPT_SAM, OPT_SUMMARY, OPT_SCALE_EVENTS, OPT_MODELS_FOFN, OPT_SAMPLES };
+enum { OPT_HELP = 1, OPT_VERSION, OPT_PROGRESS, OPT_SAM, OPT_SUMMARY, OPT_SCALE_EVENTS, OPT_MODELS_FOFN, OPT_SAMPLES, OPT_SIGNAL_INDEX };
 
 static const struct option longopts[] = {
-    { "verbose",          no_argument,       NULL, 'v' },
-    { "reads",            required_argument, NULL, 'r' },
-    { "bam",              required_argument, NULL, 'b' },
-    { "genome",           required_argument, NULL, 'g' },
-    { "window",           required_argument, NULL, 'w' },
-    { "threads",          required_argument, NULL, 't' },
-    { "summary",          required_argument, NULL, OPT_SUMMARY },
-    { "models-fofn",      required_argument, NULL, OPT_MODELS_FOFN },
-    { "print-read-names", no_argument,       NULL, 'n' },
-    { "samples",          no_argument,       NULL, OPT_SAMPLES },
-    { "scale-events",     no_argument,       NULL, OPT_SCALE_EVENTS },
-    { "sam",              no_argument,       NULL, OPT_SAM },
-    { "progress",         no_argument,       NULL, OPT_PROGRESS },
-    { "help",             no_argument,       NULL, OPT_HELP },
-    { "version",          no_argument,       NULL, OPT_VERSION },
+    { "verbose",             no_argument,       NULL, 'v' },
+    { "reads",               required_argument, NULL, 'r' },
+    { "bam",                 required_argument, NULL, 'b' },
+    { "genome",              required_argument, NULL, 'g' },
+    { "window",              required_argument, NULL, 'w' },
+    { "threads",             required_argument, NULL, 't' },
+    { "min-mapping-quality", required_argument, NULL, 'q' },
+    { "summary",             required_argument, NULL, OPT_SUMMARY },
+    { "models-fofn",         required_argument, NULL, OPT_MODELS_FOFN },
+    { "print-read-names",    no_argument,       NULL, 'n' },
+    { "samples",             no_argument,       NULL, OPT_SAMPLES },
+    { "signal-index",        no_argument,       NULL, OPT_SIGNAL_INDEX },
+    { "scale-events",        no_argument,       NULL, OPT_SCALE_EVENTS },
+    { "sam",                 no_argument,       NULL, OPT_SAM },
+    { "progress",            no_argument,       NULL, OPT_PROGRESS },
+    { "help",                no_argument,       NULL, OPT_HELP },
+    { "version",             no_argument,       NULL, OPT_VERSION },
     { NULL, 0, NULL, 0 }
 };
 
@@ -143,7 +153,7 @@ struct EventalignSummary
 };
 
 //
-const PoreModel* EventAlignmentParameters::get_model() const 
+const PoreModel* EventAlignmentParameters::get_model() const
 {
     if(this->alphabet == "") {
         return this->sr->get_base_model(this->strand_idx);
@@ -172,12 +182,12 @@ void trim_aligned_pairs_to_ref_region(std::vector<AlignedPair>& aligned_pairs, i
 {
     std::vector<AlignedPair> trimmed;
     for(size_t i = 0; i < aligned_pairs.size(); ++i) {
-        if(aligned_pairs[i].ref_pos >= ref_start && 
+        if(aligned_pairs[i].ref_pos >= ref_start &&
            aligned_pairs[i].ref_pos <= ref_end) {
             trimmed.push_back(aligned_pairs[i]);
         }
     }
-    
+
     aligned_pairs.swap(trimmed);
 }
 
@@ -190,7 +200,7 @@ int get_end_pair(const std::vector<AlignedPair>& aligned_pairs, int ref_pos_max,
             return pair_idx - 1;
         pair_idx += 1;
     }
-    
+
     return aligned_pairs.size() - 1;
 }
 
@@ -202,7 +212,7 @@ std::string get_reference_region_ts(const faidx_t* fai, const char* ref_name, in
     char* cref_seq;
     #pragma omp critical
     cref_seq = faidx_fetch_seq(fai, ref_name, start, end, fetched_len);
-    
+
     assert(cref_seq != NULL);
 
     std::string out(cref_seq);
@@ -221,6 +231,10 @@ void emit_tsv_header(FILE* fp)
     fprintf(fp, "%s\t%s\t%s\t%s\t", "event_index", "event_level_mean", "event_stdv", "event_length");
     fprintf(fp, "%s\t%s\t%s\t%s", "model_kmer", "model_mean", "model_stdv", "standardized_level");
 
+    if(opt::write_signal_index) {
+        fprintf(fp, "\t%s\t%s", "start_idx", "end_idx");
+    }
+
     if(opt::write_samples) {
         fprintf(fp, "\t%s", "samples");
     }
@@ -229,7 +243,11 @@ void emit_tsv_header(FILE* fp)
 
 void emit_sam_header(samFile* fp, const bam_hdr_t* hdr)
 {
-    sam_hdr_write(fp, hdr);
+    int ret = sam_hdr_write(fp, hdr);
+    if(ret < 0) {
+        fprintf(stderr, "error writing sam header\n");
+        exit(EXIT_FAILURE);
+    }
 }
 
 std::string cigar_ops_to_string(const std::vector<uint32_t>& ops)
@@ -280,7 +298,7 @@ std::vector<uint32_t> event_alignment_to_cigar(const std::vector<EventAlignment>
             incoming = (r_step - 1) << BAM_CIGAR_SHIFT;
             incoming |= BAM_CDEL;
             out.push_back(incoming);
-            
+
             incoming = 1 << BAM_CIGAR_SHIFT;
             incoming |= BAM_CMATCH;
         } else {
@@ -292,7 +310,7 @@ std::vector<uint32_t> event_alignment_to_cigar(const std::vector<EventAlignment>
         // If the operation matches the previous, extend the length
         // otherwise append a new op
         if(bam_cigar_op(out.back()) == bam_cigar_op(incoming)) {
-            uint32_t sum = bam_cigar_oplen(out.back()) + 
+            uint32_t sum = bam_cigar_oplen(out.back()) +
                            bam_cigar_oplen(incoming);
             out.back() = sum << BAM_CIGAR_SHIFT | bam_cigar_op(incoming);
         } else {
@@ -309,13 +327,13 @@ std::vector<uint32_t> event_alignment_to_cigar(const std::vector<EventAlignment>
 void emit_event_alignment_sam(htsFile* fp,
                               const SquiggleRead& sr,
                               const bam_hdr_t* base_hdr,
-                              const bam1_t* base_record, 
+                              const bam1_t* base_record,
                               const std::vector<EventAlignment>& alignments)
 {
     if(alignments.empty())
         return;
     bam1_t* event_record = bam_init1();
-    
+
     // Variable-length data
     std::string qname = sr.read_name + (alignments.front().strand_idx == 0 ? ".template" : ".complement");
 
@@ -328,7 +346,7 @@ void emit_event_alignment_sam(htsFile* fp,
     event_record->core.flag = alignments.front().rc ? 16 : 0;
 
     event_record->core.l_qseq = 0;
-    
+
     event_record->core.mtid = -1;
     event_record->core.mpos = -1;
     event_record->core.isize = 0;
@@ -341,23 +359,23 @@ void emit_event_alignment_sam(htsFile* fp,
                            event_record->core.n_cigar * 4 + // 4 bytes per cigar op
                            event_record->core.l_qseq + // query seq
                            event_record->core.l_qseq; // query quality
-        
+
     // nothing copied yet
     event_record->l_data = 0;
-    
+
     // allocate data
     event_record->data = (uint8_t*)malloc(event_record->m_data);
 
     // copy q name
     assert(event_record->core.l_qname <= event_record->m_data);
-    strncpy(bam_get_qname(event_record), 
+    strncpy(bam_get_qname(event_record),
             qname.c_str(),
             event_record->core.l_qname);
     event_record->l_data += event_record->core.l_qname;
-    
+
     // cigar
     assert(event_record->l_data + event_record->core.n_cigar * 4 <= event_record->m_data);
-    memcpy(bam_get_cigar(event_record), 
+    memcpy(bam_get_cigar(event_record),
            &cigar[0],
            event_record->core.n_cigar * 4);
     event_record->l_data += event_record->core.n_cigar * 4;
@@ -368,7 +386,12 @@ void emit_event_alignment_sam(htsFile* fp,
     int stride = alignments.front().event_idx < alignments.back().event_idx ? 1 : -1;
     bam_aux_append(event_record, "ES", 'i', 4, reinterpret_cast<uint8_t*>(&stride));
 
-    sam_write1(fp, base_hdr, event_record);
+    int ret = sam_write1(fp, base_hdr, event_record);
+    if(ret < 0) {
+        fprintf(stderr, "error writing sam record\n");
+        exit(EXIT_FAILURE);
+    }
+
     bam_destroy1(event_record); // automatically frees malloc'd segment
 }
 
@@ -441,6 +464,11 @@ void emit_event_alignment_tsv(FILE* fp,
                                                model_stdv,
                                                standard_level);
 
+        if(opt::write_signal_index) {
+            std::pair<size_t, size_t> signal_idx = sr.get_event_sample_idx(ea.strand_idx, ea.event_idx);
+            fprintf(fp, "\t%zu\t%zu", signal_idx.first, signal_idx.second);
+        }
+
         if(opt::write_samples) {
             std::vector<float> samples = sr.get_scaled_samples_for_event(ea.strand_idx, ea.event_idx);
             std::stringstream sample_ss;
@@ -508,11 +536,11 @@ EventalignSummary summarize_alignment(const SquiggleRead& sr,
 }
 
 // Realign the read in event space
-void realign_read(EventalignWriter writer,
-                  const ReadDB& read_db, 
-                  const faidx_t* fai, 
-                  const bam_hdr_t* hdr, 
-                  const bam1_t* record, 
+void realign_read(const ReadDB& read_db,
+                  const faidx_t* fai,
+                  const EventalignWriter& writer,
+                  const bam_hdr_t* hdr,
+                  const bam1_t* record,
                   size_t read_idx,
                   int region_start,
                   int region_end)
@@ -521,15 +549,21 @@ void realign_read(EventalignWriter writer,
     std::string read_name = bam_get_qname(record);
 
     // load read
-    SquiggleRead sr(read_name, read_db, opt::write_samples ? SRF_LOAD_RAW_SAMPLES : 0);
+    int sr_flag;
+    if(( opt::write_samples) || (opt::write_signal_index)) {
+        sr_flag = SRF_LOAD_RAW_SAMPLES;
+    } else {
+        sr_flag = 0;
+    }
+    SquiggleRead sr(read_name, read_db, sr_flag);
 
     if(opt::verbose > 1) {
-        fprintf(stderr, "Realigning %s [%zu %zu]\n", 
+        fprintf(stderr, "Realigning %s [%zu %zu]\n",
                 read_name.c_str(), sr.events[0].size(), sr.events[1].size());
     }
-    
+
     for(int strand_idx = 0; strand_idx < 2; ++strand_idx) {
-        
+
         // Do not align this strand if it was not sequenced
         if(!sr.has_events_for_strand(strand_idx)) {
             continue;
@@ -541,7 +575,7 @@ void realign_read(EventalignWriter writer,
         params.hdr = hdr;
         params.record = record;
         params.strand_idx = strand_idx;
-        
+
         params.read_idx = read_idx;
         params.region_start = region_start;
         params.region_end = region_end;
@@ -592,8 +626,11 @@ std::vector<EventAlignment> align_read_to_ref(const EventAlignmentParameters& pa
     int fetched_len = 0;
     int ref_offset = params.record->core.pos;
     std::string ref_name(params.hdr->target_name[params.record->core.tid]);
-    std::string ref_seq = get_reference_region_ts(params.fai, ref_name.c_str(), ref_offset, 
+    std::string ref_seq = get_reference_region_ts(params.fai, ref_name.c_str(), ref_offset,
                                                   bam_endpos(params.record), &fetched_len);
+
+    // convert to upper case
+    std::transform(ref_seq.begin(), ref_seq.end(), ref_seq.begin(), ::toupper);
 
     // k from read pore model
     const uint32_t k = params.sr->get_model_k(params.strand_idx);
@@ -603,8 +640,10 @@ std::vector<EventAlignment> align_read_to_ref(const EventAlignmentParameters& pa
     ref_seq = pore_model->pmalphabet->disambiguate(ref_seq);
     std::string rc_ref_seq = pore_model->pmalphabet->reverse_complement(ref_seq);
 
-    if(ref_offset == 0)
+    // Skip unmapped
+    if((params.record->core.flag & BAM_FUNMAP) != 0) {
         return alignment_output;
+    }
 
     // Get the read-to-reference aligned segments
     std::vector<AlignedSegment> aligned_segments = get_aligned_segments(params.record);
@@ -620,8 +659,9 @@ std::vector<EventAlignment> align_read_to_ref(const EventAlignmentParameters& pa
         int max_kmer_idx = params.sr->read_sequence.size() - k;
         trim_aligned_pairs_to_kmer(aligned_pairs, max_kmer_idx);
 
-        if(aligned_pairs.empty())
+        if(aligned_pairs.empty()) {
             return alignment_output;
+        }
 
         bool do_base_rc = bam_is_rev(params.record);
         bool rc_flags[2] = { do_base_rc, !do_base_rc }; // indexed by strand
@@ -631,12 +671,12 @@ std::vector<EventAlignment> align_read_to_ref(const EventAlignmentParameters& pa
         // get the event range of the read to re-align
         int read_kidx_start = aligned_pairs.front().read_pos;
         int read_kidx_end = aligned_pairs.back().read_pos;
-        
+
         if(do_base_rc) {
             read_kidx_start = params.sr->flip_k_strand(read_kidx_start, k);
             read_kidx_end = params.sr->flip_k_strand(read_kidx_end, k);
         }
-        
+
         assert(read_kidx_start >= 0);
         assert(read_kidx_end >= 0);
 
@@ -653,7 +693,7 @@ std::vector<EventAlignment> align_read_to_ref(const EventAlignmentParameters& pa
 
             // Get the index of the aligned pair approximately align_stride away
             int end_pair_idx = get_end_pair(aligned_pairs, curr_start_ref + align_stride, curr_pair_idx);
-        
+
             int curr_end_ref = aligned_pairs[end_pair_idx].ref_pos;
             int curr_end_read = aligned_pairs[end_pair_idx].read_pos;
 
@@ -670,10 +710,11 @@ std::vector<EventAlignment> align_read_to_ref(const EventAlignmentParameters& pa
             assert(fwd_subseq.length() == rc_subseq.length());
 
             HMMInputSequence hmm_sequence(fwd_subseq, rc_subseq, pore_model->pmalphabet);
-            
+
             // Require a minimum amount of sequence to align to
-            if(hmm_sequence.length() < 2 * k)
+            if(hmm_sequence.length() < 2 * k) {
                 break;
+            }
 
             // Set up HMM input
             HMMInputData input;
@@ -697,7 +738,7 @@ std::vector<EventAlignment> align_read_to_ref(const EventAlignmentParameters& pa
             input.rc = rc_flags[params.strand_idx];
 
             std::vector<HMMAlignmentState> event_alignment = profile_hmm_align(hmm_sequence, input);
-            
+
             // Output alignment
             size_t num_output = 0;
             size_t event_align_idx = 0;
@@ -725,14 +766,14 @@ std::vector<EventAlignment> align_read_to_ref(const EventAlignmentParameters& pa
             int last_event_output = 0;
             int last_ref_kmer_output = 0;
 
-            for(; event_align_idx < event_alignment.size() && 
+            for(; event_align_idx < event_alignment.size() &&
                   (num_output < output_stride || last_section); event_align_idx++) {
 
                 HMMAlignmentState& as = event_alignment[event_align_idx];
                 if(as.state != 'K' && (int)as.event_idx != curr_start_event) {
 
                     EventAlignment ea;
-                    
+
                     // ref
                     ea.ref_name = ref_name;
                     ea.ref_position = curr_start_ref + as.kmer_idx;
@@ -796,8 +837,10 @@ void parse_eventalign_options(int argc, char** argv)
             case 'b': arg >> opt::bam_file; break;
             case '?': die = true; break;
             case 't': arg >> opt::num_threads; break;
+            case 'q': arg >> opt::min_mapping_quality; break;
             case 'n': opt::print_read_names = true; break;
             case 'f': opt::full_output = true; break;
+            case OPT_SIGNAL_INDEX: opt::write_signal_index = true; break;
             case OPT_SAMPLES: opt::write_samples = true; break;
             case 'v': opt::verbose++; break;
             case OPT_MODELS_FOFN: arg >> opt::models_fofn; break;
@@ -832,7 +875,7 @@ void parse_eventalign_options(int argc, char** argv)
         std::cerr << SUBPROGRAM ": a --reads file must be provided\n";
         die = true;
     }
-    
+
     if(opt::genome_file.empty()) {
         std::cerr << SUBPROGRAM ": a --genome file must be provided\n";
         die = true;
@@ -848,7 +891,7 @@ void parse_eventalign_options(int argc, char** argv)
         PoreModelSet::initialize(opt::models_fofn);
     }
 
-    if (die) 
+    if (die)
     {
         std::cout << "\n" << EVENTALIGN_USAGE_MESSAGE;
         exit(EXIT_FAILURE);
@@ -862,41 +905,9 @@ int eventalign_main(int argc, char** argv)
 
     ReadDB read_db;
     read_db.load(opt::reads_file);
-    
-    // Open the BAM and iterate over reads
 
-    // load bam file
-    htsFile* bam_fh = sam_open(opt::bam_file.c_str(), "r");
-    assert(bam_fh != NULL);
-
-    // load bam index file
-    std::string index_filename = opt::bam_file + ".bai";
-    hts_idx_t* bam_idx = bam_index_load(index_filename.c_str());
-    if(bam_idx == NULL) {
-        bam_index_error_exit(opt::bam_file);
-    }
-
-    // read the bam header
-    bam_hdr_t* hdr = sam_hdr_read(bam_fh);
-    
     // load reference fai file
     faidx_t *fai = fai_load(opt::genome_file.c_str());
-
-    hts_itr_t* itr;
-
-    // If processing a region of the genome, only emit events aligned to this window
-    int clip_start = -1;
-    int clip_end = -1;
-
-    if(opt::region.empty()) {
-        // TODO: is this valid?
-        itr = sam_itr_queryi(bam_idx, HTS_IDX_START, 0, 0);
-    } else {
-
-        fprintf(stderr, "Region: %s\n", opt::region.c_str());
-        itr = sam_itr_querys(bam_idx, hdr, opt::region.c_str());
-        hts_parse_reg(opt::region.c_str(), &clip_start, &clip_end);
-    }
 
 #ifndef H5_HAVE_THREADSAFE
     if(opt::num_threads > 1) {
@@ -909,72 +920,31 @@ int eventalign_main(int argc, char** argv)
     // Initialize output
     EventalignWriter writer = { NULL, NULL, NULL };
 
-    if(opt::output_sam) {
-        writer.sam_fp = hts_open("-", "w");
-        emit_sam_header(writer.sam_fp, hdr);
-    } else {
-        writer.tsv_fp = stdout;
-        emit_tsv_header(writer.tsv_fp);
-    }
-
     if(!opt::summary_file.empty()) {
         writer.summary_fp = fopen(opt::summary_file.c_str(), "w");
         // header
         fprintf(writer.summary_fp, "read_index\tread_name\tfast5_path\tmodel_name\tstrand\tnum_events\t");
         fprintf(writer.summary_fp, "num_steps\tnum_skips\tnum_stays\ttotal_duration\tshift\tscale\tdrift\tvar\n");
     }
-    
-    // Initialize iteration
-    std::vector<bam1_t*> records(opt::batch_size, NULL);
-    for(size_t i = 0; i < records.size(); ++i) {
-        records[i] = bam_init1();
+
+    // the BamProcessor framework calls the input function with the
+    // bam record, read index, etc passed as parameters
+    // bind the other parameters the worker function needs here
+    auto f = std::bind(realign_read, std::ref(read_db), std::ref(fai), std::ref(writer), _1, _2, _3, _4, _5);
+    BamProcessor processor(opt::bam_file, opt::region, opt::num_threads);
+    processor.set_min_mapping_quality(opt::min_mapping_quality);
+
+    // Copy the bam header to std
+    if(opt::output_sam) {
+        writer.sam_fp = hts_open("-", "w");
+        emit_sam_header(writer.sam_fp, processor.get_bam_header());
+    } else {
+        writer.tsv_fp = stdout;
+        emit_tsv_header(writer.tsv_fp);
     }
 
-    int result;
-    size_t num_reads_realigned = 0;
-    size_t num_records_buffered = 0;
-    Progress progress("[eventalign]");
-
-    do {
-        assert(num_records_buffered < records.size());
-        
-        // read a record into the next slot in the buffer
-        result = sam_itr_next(bam_fh, itr, records[num_records_buffered]);
-        
-        num_records_buffered += result >= 0;
-        // realign if we've hit the max buffer size or reached the end of file
-        if(num_records_buffered == records.size() || result < 0) {
-            #pragma omp parallel for            
-            for(size_t i = 0; i < num_records_buffered; ++i) {
-                bam1_t* record = records[i];
-                size_t read_idx = num_reads_realigned + i;
-                if( (record->core.flag & BAM_FUNMAP) == 0) {
-                    realign_read(writer, read_db, fai, hdr, record, read_idx, clip_start, clip_end);
-                }
-            }
-
-            num_reads_realigned += num_records_buffered;
-            num_records_buffered = 0;
-        }
-
-        if(opt::progress) {
-            fprintf(stderr, "Realigned %zu reads in %.1lfs\r", num_reads_realigned, progress.get_elapsed_seconds());
-        }
-    } while(result >= 0);
- 
-    assert(num_records_buffered == 0);
-
-    // cleanup records
-    for(size_t i = 0; i < records.size(); ++i) {
-        bam_destroy1(records[i]);
-    }
-
-    // cleanup
-    sam_itr_destroy(itr);
-    bam_hdr_destroy(hdr);
-    fai_destroy(fai);
-    sam_close(bam_fh);
-    hts_idx_destroy(bam_idx);
+    // run
+    processor.parallel_run(f);
 
     if(writer.sam_fp != NULL) {
         hts_close(writer.sam_fp);
@@ -983,5 +953,7 @@ int eventalign_main(int argc, char** argv)
     if(writer.summary_fp != NULL) {
         fclose(writer.summary_fp);
     }
+
+    fai_destroy(fai);
     return EXIT_SUCCESS;
 }

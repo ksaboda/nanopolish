@@ -15,6 +15,7 @@
 #include "nanopolish_eventalign.h"
 #include "nanopolish_read_db.h"
 #include "nanopolish_pore_model_set.h"
+#include "nanopolish_fast5_io.h"
 #include <string>
 
 enum PoreType
@@ -244,6 +245,7 @@ class SquiggleRead
         // Sample-level access
         size_t get_sample_index_at_time(size_t sample_time) const;
         std::vector<float> get_scaled_samples_for_event(size_t strand_idx, size_t event_idx) const;
+        std::pair<size_t, size_t> get_event_sample_idx(size_t strand_idx, size_t event_idx) const;
 
         // print the scaling parameters for this strand
         void print_scaling_parameters(FILE* fp, size_t strand_idx) const
@@ -302,7 +304,7 @@ class SquiggleRead
         void load_from_events(const uint32_t flags);
 
         // Load all read data from raw samples
-        void load_from_raw(const uint32_t flags);
+        void load_from_raw(fast5_file& f5_file, const uint32_t flags);
 
         // Version-specific intialization functions
         void _load_R7(uint32_t si);

@@ -239,6 +239,18 @@ class Alphabet
 
         // does this alphabet contain all of the nucleotides in bases?
         virtual bool contains_all(const char *bases) const = 0;
+
+        // check if the motif matches a recognition site
+        bool is_motif_match(const std::string& str, const size_t i) const
+        {
+            RecognitionMatch match;
+            for(size_t j = 0; j < num_recognition_sites(); ++j){
+                match = match_to_site(str, i, get_recognition_site(j), recognition_length());
+                if(match.length == recognition_length())
+                    return true;
+            }
+            return false;
+        }
 };
 
 #define BASIC_MEMBER_BOILERPLATE \
@@ -344,6 +356,26 @@ struct MethylCpGAlphabet : public Alphabet
 };
 
 //
+// methyl-cytosine in GC context
+//
+struct MethylGpCAlphabet : public Alphabet
+{
+    // member variables, expanded by macrocs
+    BASIC_MEMBER_BOILERPLATE
+    METHYLATION_MEMBER_BOILERPLATE
+
+    // member functions
+    BASIC_ACCESSOR_BOILERPLATE
+    METHYLATION_ACCESSOR_BOILERPLATE
+
+    // does this alphabet contain all of the nucleotides in bases?
+    virtual inline bool contains_all(const char *bases) const
+    {
+        return strspn(bases, _base) == strlen(bases);
+    }
+};
+
+//
 // Dam methylation: methyl-adenine in GATC context
 // 
 struct MethylDamAlphabet : public Alphabet
@@ -386,6 +418,7 @@ struct MethylDcmAlphabet : public Alphabet
 // Global alphabet objects that can be re-used
 extern DNAAlphabet gDNAAlphabet;
 extern MethylCpGAlphabet gMCpGAlphabet;
+extern MethylGpCAlphabet gMethylGpCAlphabet;
 extern MethylDamAlphabet gMethylDamAlphabet;
 extern MethylDcmAlphabet gMethylDcmAlphabet;
 extern UtoTRNAAlphabet gUtoTRNAAlphabet;

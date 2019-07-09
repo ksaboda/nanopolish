@@ -16,10 +16,12 @@
 
 BamProcessor::BamProcessor(const std::string& bam_file,
                            const std::string& region,
-                           const int num_threads) :
+                           const int num_threads,
+                           const int batch_size) :
                             m_bam_file(bam_file),
                             m_region(region),
-                            m_num_threads(num_threads)
+                            m_num_threads(num_threads),
+                            m_batch_size(batch_size)
 
 {
     // load bam file
@@ -27,8 +29,7 @@ BamProcessor::BamProcessor(const std::string& bam_file,
     assert(m_bam_fh != NULL);
 
     // load bam index file
-    std::string index_filename = m_bam_file + ".bai";
-    m_bam_idx = bam_index_load(index_filename.c_str());
+    m_bam_idx = sam_index_load(m_bam_fh, bam_file.c_str());
     if(m_bam_idx == NULL) {
         bam_index_error_exit(m_bam_file);
     }
@@ -99,11 +100,11 @@ void BamProcessor::parallel_run( std::function<void(const bam_hdr_t* hdr,
 
         // realign if we've hit the max buffer size or reached the end of file
         if(num_records_buffered == records.size() || result < 0 || (num_records_buffered + num_reads_realigned == m_max_reads)) {
-            #pragma omp parallel for
+            #pragma omp parallel for schedule(dynamic)
             for(size_t i = 0; i < num_records_buffered; ++i) {
                 bam1_t* record = records[i];
                 size_t read_idx = num_reads_realigned + i;
-                if( (record->core.flag & BAM_FUNMAP) == 0) {
+                if( (record->core.flag & BAM_FUNMAP) == 0 && record->core.qual >= m_min_mapping_quality) {
                     func(m_hdr, record, read_idx, clip_start, clip_end);
                 }
             }
